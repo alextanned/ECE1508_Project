@@ -9,9 +9,12 @@ import datetime
 import wandb
 import json
 import nlpaug.augmenter.word as naw
+import random
+import copy
 
 import torch
 from transformers import AutoTokenizer, AutoModelForMultipleChoice
+
 
 
 def data_prep(args):
@@ -24,20 +27,32 @@ def data_prep(args):
     # Apply augmentation if specified
     if args.aug:
         # Augment with synonyms using WordNet
-        aug = naw.SynonymAug(aug_src='wordnet')
+        # Initialize augmenters
+        aug_syn = naw.SynonymAug(aug_src='wordnet')
+        aug_spell = naw.SpellingAug()
+
+        new_train_samples = []
         for sample in train_data:
-            sample['query'] = aug.augment(sample['query'])
-        
-        # Augment with spelling corrections
-        aug_spelling = naw.SpellingAug()
-        for sample in train_data:
-            sample['query'] = aug_spelling.augment(sample['query'])
-        
-        # Optionally, if you want to create additional examples rather than replace:
-        # You can create copies of the original data and then concatenate:
-        # new_train_data = [dict(sample, query=aug.augment(sample['query'])) for sample in train_data]
-        # more_train_data = [dict(sample, query=aug_spelling.augment(sample['query'])) for sample in train_data]
-        # train_data = train_data + new_train_data + more_train_data
+            # Create a deep copy of the sample for each augmentation type.
+            sample_syn = copy.deepcopy(sample)
+            sample_spell = copy.deepcopy(sample)
+            
+            # Augment using synonym augmentation
+            sample_syn['query'] = aug_syn.augment(sample_syn['query'])[0]
+            for key in sample_syn['options'].keys():
+                sample_syn['options'][key] = aug_syn.augment(sample_syn['options'][key])[0]
+            
+            # Augment using spelling augmentation
+            sample_spell['query'] = aug_spell.augment(sample_spell['query'])[0]
+            for key in sample_spell['options'].keys():
+                sample_spell['options'][key] = aug_spell.augment(sample_spell['options'][key])[0]
+            
+            # Append the augmented copies to the list of new samples.
+            new_train_samples.append(sample_syn)
+            # new_train_samples.append(sample_spell)
+            
+        # Concatenate original train data with new augmented samples.
+        train_data = train_data + new_train_samples
 
     if args.debug:
         train_data = train_data[:10]
@@ -153,7 +168,7 @@ def create_dataset(examples, tokenizer):
     return dataset
 
 
-def get_data_loaders(train_dataset, val_dataset):
+def get_data_loaders(train_dataset, val_dataset, generator):
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         sampler=torch.utils.data.RandomSampler(train_dataset),
@@ -189,6 +204,14 @@ def accuracy(preds, labels):
 
 
 def train(args):
+
+    # seed = 42
+    # random.seed(seed)
+    # np.random.seed(seed)
+    # torch.manual_seed(seed)
+    # if torch.cuda.is_available():
+    #     torch.cuda.manual_seed_all(seed)
+    # generator = torch.Generator().manual_seed(seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # For multiple choice, data_prep returns a list of dict examples.
@@ -204,7 +227,7 @@ def train(args):
     epochs = wandb.config.epochs
 
     # Get data loaders
-    train_dataloader, validation_dataloader = get_data_loaders(train_dataset, val_dataset)
+    train_dataloader, validation_dataloader = get_data_loaders(train_dataset, val_dataset, generator=None)
 
     optimizer = get_optimizer(model)
     scheduler = get_scheduler(train_dataloader, optimizer)
@@ -278,14 +301,13 @@ def train(args):
             b_labels = batch[2].to(device)
 
             with torch.no_grad():
-                loss, logits = model(b_input_ids,
-                                     attention_mask=b_input_mask,
-                                     labels=b_labels).to_tuple()
-                total_test_loss += loss.item()
+                val_loss, val_logits = model(b_input_ids,
+                                    attention_mask=b_input_mask,
+                                    labels=b_labels).to_tuple()
 
-            logits = logits.detach().cpu().numpy()
+            val_logits = val_logits.detach().cpu().numpy()
             label_ids = b_labels.cpu().numpy()
-            total_test_accuracy += accuracy(logits, label_ids)
+            total_test_accuracy += accuracy(val_logits, label_ids)
 
         avg_test_accuracy = total_test_accuracy / len(validation_dataloader)
         print("  accuracy: {0:.4f}".format(avg_test_accuracy))
@@ -305,9 +327,12 @@ def train(args):
 
     print("training complete!")
     print("total training took {:} (h:mm:ss)".format(format_time(time.time()-total_t0)))
+    print("best accuracy: ", best_accuracy)
 
 
 if __name__ == "__main__":
+
+    
 
     args = parse_arguments()
     print(args)
